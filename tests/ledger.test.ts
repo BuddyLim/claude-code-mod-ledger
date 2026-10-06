@@ -332,26 +332,265 @@ test('the pane lists tasks, agents and findings; a finding goes to the prompt, a
     })
     const has = async (text: RegExp) => (await ui.find({ type: 'Text', text })) !== undefined
 
+    // The list: one run, not done.
+    expect(await has(/1 open · 0 done/)).toBe(true)
+    expect(await has(/1\/3 · .* 1 · .* 1/)).toBe(true)
+    await ui.press({ key: 'run-1' })
+
+    // The run, in few words: a line a task, the failed gate's note beside it,
+    // the running subagent's model beside its task, each open finding a line.
     expect(await has(/Queue retries/)).toBe(true)
-    expect(await has(/1\/3 tasks/)).toBe(true)
+    expect(await has(/1\/3/)).toBe(true)
     expect(await has(/migration fails/)).toBe(true)
-    // What a unit and a task are for, and what a finished task did.
-    expect(await has(/Gives each job a place to count its attempts/)).toBe(true)
-    expect(await has(/Retries a failed job with backoff/)).toBe(true)
-    expect(await has(/Backfilled attempts in migration 0043/)).toBe(true)
-    expect(await has(/\[T3\] add the retry/)).toBe(true)
-    expect(await has(/1 running · 0 finished/)).toBe(true)
-    expect(await has(/1 open · 1 fixed/)).toBe(true)
+    expect(await has(/claude-opus/)).toBe(true)
+    expect(await has(/1 open/)).toBe(true)
     expect(await has(/no backoff/)).toBe(true)
-    // The fixed finding is listed only once all are asked for.
+    // What each part is for, what was done and what is fixed wait for details.
+    expect(await has(/Gives each job a place to count its attempts/)).toBe(false)
+    expect(await has(/Backfilled attempts in migration 0043/)).toBe(false)
     expect(await has(/mention the flag/)).toBe(false)
 
     await ui.press({ key: 'finding-1' })
     expect(filled.at(-1)).toBe('Finding #1 (error) src/queue.ts:40: no backoff\n')
 
-    await ui.press({ key: 'all' })
+    await ui.press({ key: 'details' })
+    expect(await has(/Gives each job a place to count its attempts/)).toBe(true)
+    expect(await has(/Retries a failed job with backoff/)).toBe(true)
+    expect(await has(/Backfilled attempts in migration 0043/)).toBe(true)
     expect(await has(/mention the flag/)).toBe(true)
+    await ui.press({ key: 'details' })
+
+    // Back on the list, the run is closed by hand, shown among the done ones,
+    // and opened again.
+    await ui.press({ key: 'back' })
+    await ui.press({ key: 'done' })
+    expect(await has(/0 open · 1 done/)).toBe(true)
+    expect(await has(/Every run is done/)).toBe(true)
+    await ui.press({ key: 'all' })
+    await ui.press({ key: 'done' })
+    expect(await has(/1 open · 0 done/)).toBe(true)
     await ui.press({ key: 'all' })
     await ui.unmount()
   }
+})
+
+test('several tasks and several findings each go in one call, and one bad entry refuses the call', async ($, on) => {
+  mock.store(on)
+  mock.clock(on)
+  on('session.cwd', () => ({ value: '/project' }))
+  on('session.id', () => ({ value: 's1' }))
+
+  await $.tool.call({ tool: 'mcp__ledger__plan', goal: 'Queue retries', tasks: TASKS })
+
+  const updated = await $.tool.call({
+    tool: 'mcp__ledger__task',
+    tasks: [
+      { id: 'T1', status: 'done', outcome: 'Migration 0042 adds jobs.attempts.' },
+      { id: 'T2', status: 'gate-failed', note: 'the   backfill\ntest fails' },
+    ],
+  })
+  expect(updated.result).toBe('T1 done, T2 gate-failed')
+
+  // One unknown id: nothing of the call is kept.
+  const refused = await $.tool.call({
+    tool: 'mcp__ledger__task',
+    tasks: [
+      { id: 'T3', status: 'done' },
+      { id: 'T9', status: 'done' },
+    ],
+  })
+  expect(String(refused.deny)).toContain('No task T9')
+
+  const found = await $.tool.call({
+    tool: 'mcp__ledger__finding',
+    findings: [
+      { path: 'src/a.ts', line: 3, severity: 'error', summary: 'drops jobs', task: 'T2' },
+      { path: 'src/b.ts', severity: 'note', summary: 'x'.repeat(400) },
+    ],
+  })
+  expect(found.result).toBe('Recorded as findings #1 to #2.')
+  expect(String((await $.tool.call({ tool: 'mcp__ledger__finding', findings: [{ path: 'a.ts' }] })).deny)).toContain(
+    'Each finding needs',
+  )
+
+  const read = String((await $.tool.call({ tool: 'mcp__ledger__report' })).result)
+  expect(read).toContain('[done] T1 (haiku) add the column')
+  expect(read).toContain('      Outcome: Migration 0042 adds jobs.attempts.')
+  // A note is kept as one line.
+  expect(read).toContain('[gate-failed] T2 (sonnet) backfill: the backfill test fails')
+  expect(read).toContain('[todo] T3 (opus) add the retry')
+  expect(read).toContain('#1 error src/a.ts:3 drops jobs (T2)')
+  // What is written is cut to a line's length.
+  expect(read).not.toContain('x'.repeat(201))
+})
+
+test('each write finds its own run; a run closes by itself, and clearing asks first', async ($, on) => {
+  mock.store(on)
+  mock.clock(on)
+  const entries: (string | undefined)[] = []
+  on('session.cwd', () => ({ value: '/project' }))
+  on('session.id', () => ({ value: 's1' }))
+  on('agent.spawn', () => ({ model: 'claude-haiku', agentId: 'agent-a' }))
+  on('ui.status', (_$, e) => {
+    entries.push(e.text)
+
+    return { value: undefined }
+  })
+
+  await $.tool.call({ tool: 'mcp__ledger__plan', goal: 'First feature', tasks: [{ id: 'A1', title: 'a' }] })
+  await $.tool.call({ tool: 'mcp__ledger__plan', goal: 'Second feature', tasks: [{ id: 'B1', title: 'b' }] })
+
+  // An id a run under way already uses is refused: it is how writes are routed.
+  const taken = await $.tool.call({ tool: 'mcp__ledger__plan', goal: 'Third', tasks: [{ id: 'A1', title: 'again' }] })
+  expect(String(taken.deny)).toContain('Task id A1 is in use by a run still under way')
+
+  // Both runs are under way: the report and the status line cover both.
+  const both = String((await $.tool.call({ tool: 'mcp__ledger__report' })).result)
+  expect(both).toContain('Ledger: Second feature')
+  expect(both).toContain('Ledger: First feature')
+  expect(entries.at(-1)).toContain('Second feature 0/1 · First feature 0/1')
+
+  // A spawn, a finding and a task update for the older run land in it, with no
+  // run picked by hand.
+  await $.agent.spawn({
+    tool_use_id: 'toolu_1',
+    prompt: 'Do a.',
+    description: '[A1] do a',
+    subagentType: 'general-purpose',
+    provider: { plugin: 'engine', tier: 'core' },
+    parentModel: 'claude-opus',
+    background: true,
+    fork: false,
+  })
+  await $.tool.call({
+    tool: 'mcp__ledger__finding',
+    findings: [{ path: 'a.ts', severity: 'note', summary: 'from the first run' }],
+    agentId: 'agent-a',
+  })
+  await $.tool.call({
+    tool: 'mcp__ledger__finding',
+    findings: [{ path: 'b.ts', severity: 'note', summary: 'from the second run', task: 'B1' }],
+  })
+
+  const routed = String((await $.tool.call({ tool: 'mcp__ledger__report' })).result)
+  const [second = '', first = ''] = routed.split('\n\n')
+  expect(first).toContain('[running] A1 a')
+  // Findings are numbered across the runs, so a number names one.
+  expect(first).toContain('#1 note a.ts from the first run (A1)')
+  expect(second).toContain('#2 note b.ts from the second run (B1)')
+  expect((await $.tool.call({ tool: 'mcp__ledger__fixed', ids: [1, 2] })).result).toBe('Marked 2 fixed.')
+
+  const ui = await $.ui.mount({
+    plugin: 'ledger',
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'ledger',
+    props: {
+      title: 'Ledger',
+      isFocused: true,
+      bodyColumns: 80,
+      placement: 'dock',
+      scroll: { offset: 0, bodyRows: 40 },
+      view: {},
+    },
+    viewport: { columns: 80, rows: 40 },
+  })
+  const has = async (text: RegExp) => (await ui.find({ type: 'Text', text })) !== undefined
+  const row = async (key: string) => (await ui.find({ key })) !== undefined
+
+  expect(await has(/2 open · 0 done/)).toBe(true)
+  expect(await row('run-1')).toBe(true)
+  expect(await row('run-2')).toBe(true)
+  // There is no run to pick: nothing switches which run is written to.
+  expect(await row('use')).toBe(false)
+
+  // Its one task done with nothing open: the second run is done by itself.
+  expect((await $.tool.call({ tool: 'mcp__ledger__task', tasks: [{ id: 'B1', status: 'done' }] })).result).toBe(
+    'B1 done',
+  )
+  expect(await has(/1 open · 1 done/)).toBe(true)
+  expect(await row('run-2')).toBe(false)
+
+  // Clearing the first asks, and no keeps it.
+  await ui.press({ key: 'clear' })
+  expect(await has(/Clear run 1 for good\?/)).toBe(true)
+  await ui.press({ key: 'no' })
+  expect(await row('run-1')).toBe(true)
+  await ui.press({ key: 'clear' })
+  await ui.press({ key: 'yes' })
+  expect(await row('run-1')).toBe(false)
+  expect(await has(/0 open · 1 done/)).toBe(true)
+})
+
+test('a plan in lanes shows each lane’s progress, in the status line, the report and the pane', async ($, on) => {
+  mock.store(on)
+  mock.clock(on)
+  const entries: (string | undefined)[] = []
+  on('session.cwd', () => ({ value: '/project' }))
+  on('session.id', () => ({ value: 's1' }))
+  on('agent.spawn', () => ({ model: 'claude-sonnet', agentId: 'agent-w' }))
+  on('ui.status', (_$, e) => {
+    entries.push(e.text)
+
+    return { value: undefined }
+  })
+
+  await $.tool.call({
+    tool: 'mcp__ledger__plan',
+    goal: 'Checkout redesign',
+    tasks: [
+      { id: 'A1', lane: 'API', unit: 'Schema', title: 'add the table' },
+      { id: 'A2', lane: 'API', unit: 'Endpoints', title: 'add the route' },
+      { id: 'W1', lane: 'Web', unit: 'Cart page', title: 'draw the cart' },
+      { id: 'M1', lane: 'Mobile', unit: 'Cart screen', title: 'draw the screen' },
+    ],
+  })
+  await $.tool.call({
+    tool: 'mcp__ledger__task',
+    tasks: [
+      { id: 'A1', status: 'done' },
+      { id: 'M1', status: 'gate-failed', note: 'tests fail' },
+    ],
+  })
+  await $.agent.spawn({
+    tool_use_id: 'toolu_1',
+    prompt: 'Draw the cart.',
+    description: '[W1] draw the cart',
+    subagentType: 'general-purpose',
+    provider: { plugin: 'engine', tier: 'core' },
+    parentModel: 'claude-opus',
+    background: true,
+    fork: false,
+  })
+
+  // The status line: a count per lane, a failed gate marked on its lane.
+  expect(entries.at(-1)).toMatch(/API 1\/2 · Web 0\/1 · Mobile . 0\/1/)
+
+  const read = String((await $.tool.call({ tool: 'mcp__ledger__report' })).result)
+  expect(read).toContain('Lane API (1/2 done)')
+  expect(read).toContain('Lane Mobile (0/1 done)')
+
+  const ui = await $.ui.mount({
+    plugin: 'ledger',
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'ledger',
+    props: {
+      title: 'Ledger',
+      isFocused: true,
+      bodyColumns: 80,
+      placement: 'dock',
+      scroll: { offset: 0, bodyRows: 40 },
+      view: {},
+    },
+    viewport: { columns: 80, rows: 40 },
+  })
+  const has = async (text: RegExp) => (await ui.find({ type: 'Text', text })) !== undefined
+
+  await ui.press({ key: 'run-1' })
+  expect(await has(/^API/)).toBe(true)
+  expect(await has(/^Web/)).toBe(true)
+  expect(await has(/^Mobile/)).toBe(true)
+  expect(await has(/Cart page/)).toBe(true)
+  expect(await has(/tests fail/)).toBe(true)
 })

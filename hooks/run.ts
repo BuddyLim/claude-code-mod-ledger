@@ -15,6 +15,7 @@ import { cut } from './kit/layout'
 
 export type NewTask = {
   id: string
+  lane?: string
   unit?: string
   title: string
   about?: string
@@ -68,12 +69,14 @@ export const plan = (
     .filter(one => planned.has(one.name) && one.about !== '')
 
   return {
+    id: 0,
     goal: goal.trim(),
     startedAt: now,
     ...(sessionId !== undefined ? { sessionId } : {}),
     ...(described.length > 0 ? { units: described } : {}),
     tasks: tasks.map(one => ({
       id: one.id.trim(),
+      ...(one.lane?.trim() ? { lane: one.lane.trim() } : {}),
       unit: one.unit?.trim() || 'main',
       title: one.title.trim(),
       ...(one.tier ? { tier: one.tier.trim() } : {}),
@@ -135,7 +138,18 @@ export const taskOf = (run: LedgerRun, description: string, prompt = ''): string
       })
       .sort((a, b) => a.at - b.at || b.id.length - a.id.length)[0]?.id
 
-  return named(description, false) ?? named(description, true) ?? named(prompt, false)
+  // A run read from a plan document numbers its tasks T1, T2, ...: there a
+  // description that says "Task 3", as the document does, names T3.
+  const spoken =
+    run.doc === undefined
+      ? undefined
+      : run.tasks.find(one =>
+          new RegExp(`(?<![A-Za-z0-9_])Task\\s+${escaped(one.id.replace(/^T/, ''))}(?![A-Za-z0-9_.-])`, 'i').test(
+            description,
+          ),
+        )?.id
+
+  return named(description, false) ?? named(description, true) ?? spoken ?? named(prompt, false)
 }
 
 // Records a subagent as started. Its task, when still to do, is now running.
@@ -225,19 +239,59 @@ export const fixed = (run: LedgerRun, ids: readonly number[]): LedgerRun | strin
       }
 }
 
-export type LedgerUnit = { name: string; about?: string; tasks: LedgerTask[] }
+export type LedgerUnit = { name: string; lane?: string; about?: string; tasks: LedgerTask[] }
 
-// The units in the order the plan first names them.
+// The units in the order the plan first names them. Two lanes may each have a
+// unit of one name: they are two units.
 export const unitsOf = (run: LedgerRun): LedgerUnit[] =>
-  [...new Set(run.tasks.map(one => one.unit))].map(name => {
+  [...new Set(run.tasks.map(one => `${one.lane ?? ''}\n${one.unit}`))].map(key => {
+    const [lane = '', name = ''] = key.split('\n')
     const about = run.units?.find(one => one.name === name)?.about
 
     return {
       name,
+      ...(lane !== '' ? { lane } : {}),
       ...(about !== undefined ? { about } : {}),
-      tasks: run.tasks.filter(one => one.unit === name),
+      tasks: run.tasks.filter(one => (one.lane ?? '') === lane && one.unit === name),
     }
   })
+
+export type LedgerLane = {
+  // '' for the tasks of a run that names no lane for them.
+  name: string
+  units: LedgerUnit[]
+  tasks: number
+  done: number
+  failed: number
+  // The subagents running on this lane's tasks.
+  agents: number
+}
+
+// Whether the plan split the run into lanes: parallel tracks of one feature.
+export const hasLanes = (run: LedgerRun): boolean => run.tasks.some(one => one.lane !== undefined)
+
+// The run's lanes in the order the plan first names them. A run with no lanes
+// is one lane with no name.
+export const lanesOf = (run: LedgerRun): LedgerLane[] => {
+  const units = unitsOf(run)
+
+  return [...new Set(units.map(one => one.lane ?? ''))].map(name => {
+    const mine = units.filter(one => (one.lane ?? '') === name)
+    const tasks = mine.flatMap(one => one.tasks)
+    const ids = new Set(tasks.map(one => one.id))
+
+    return {
+      name,
+      units: mine,
+      tasks: tasks.length,
+      done: tasks.filter(one => one.status === 'done').length,
+      failed: tasks.filter(one => one.status === 'gate-failed').length,
+      agents: run.spawns.filter(
+        one => one.endedAt === undefined && one.task !== undefined && ids.has(one.task),
+      ).length,
+    }
+  })
+}
 
 export type LedgerCounts = {
   units: number
@@ -296,6 +350,22 @@ export const statusText = (run: LedgerRun): string | undefined => {
     return undefined
   }
 
+  // A run in lanes says how each lane stands, a failed gate marked on its lane.
+  if (hasLanes(run) && !isDone(run)) {
+    return [
+      `${ICON.tasks} ${lanesOf(run)
+        .map(
+          lane =>
+            `${lane.name === '' ? 'other' : lane.name} ${lane.failed > 0 ? `${ICON.failed} ` : ''}${lane.done}/${lane.tasks}`,
+        )
+        .join(' · ')}`,
+      counts.agents > 0 ? `${ICON.agents} ${counts.agents}` : '',
+      counts.openFindings > 0 ? `${ICON.finding} ${counts.openFindings}` : '',
+    ]
+      .filter(Boolean)
+      .join(' · ')
+  }
+
   return [
     `${ICON.tasks} ${
       isDone(run)
@@ -344,6 +414,19 @@ export const spawnMeta = (spawn: LedgerSpawn, now: number): string =>
     .join(' · ')
 
 // The run as text: what /ledger print shows and what the model reads back.
+// A task's steps done of all, where its run is read from a plan document: ''
+// for a task with no steps.
+export const stepsText = (task: LedgerTask): string =>
+  task.steps === undefined || task.steps.length === 0
+    ? ''
+    : `${task.steps.filter(one => one.isDone).length}/${task.steps.length}`
+
+const laneDone = (run: LedgerRun, name: string): string => {
+  const lane = lanesOf(run).find(one => one.name === name)
+
+  return `${lane?.done ?? 0}/${lane?.tasks ?? 0} done`
+}
+
 export const report = (run: LedgerRun, isPlain = false): string => {
   const counts = countsOf(run)
   const open = run.findings.filter(one => one.status === 'open')
@@ -351,11 +434,16 @@ export const report = (run: LedgerRun, isPlain = false): string => {
 
   return [
     `Ledger: ${run.goal === '' ? '(no goal given)' : run.goal}`,
-    ...unitsOf(run).flatMap(unit => [
+    ...(run.doc !== undefined ? [`Plan: ${run.doc.path}`] : []),
+    ...unitsOf(run).flatMap((unit, at, units) => [
+      // A lane's heading comes before its first unit.
+      ...(unit.lane !== undefined && units[at - 1]?.lane !== unit.lane
+        ? [`Lane ${unit.lane} (${laneDone(run, unit.lane)})`]
+        : []),
       `${unit.name} (${unit.tasks.filter(one => one.status === 'done').length}/${unit.tasks.length} done)`,
       ...(unit.about !== undefined ? [`  ${unit.about}`] : []),
       ...unit.tasks.flatMap(one => [
-        `  ${mark(one.status)} ${one.id}${one.tier ? ` (${one.tier})` : ''} ${one.title}${one.note ? `: ${cut(one.note, 160)}` : ''}`,
+        `  ${mark(one.status)} ${one.id}${one.tier ? ` (${one.tier})` : ''} ${one.title}${stepsText(one) === '' ? '' : ` [${stepsText(one)}]`}${one.note ? `: ${cut(one.note, 160)}` : ''}`,
         // Once it is done, what was done says more than what it was for.
         ...(one.outcome !== undefined
           ? [`      Outcome: ${cut(one.outcome, 300)}`]
