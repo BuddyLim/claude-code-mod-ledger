@@ -21,6 +21,8 @@ export type NewTask = {
   about?: string
   tier?: string
   check?: string
+  // The tasks it needs done first, by id.
+  needs?: string[]
 }
 
 export type NewFinding = {
@@ -33,7 +35,22 @@ export type NewFinding = {
 }
 
 export const SEVERITIES: readonly LedgerSeverity[] = ['error', 'warning', 'note']
-export const STATUSES: readonly LedgerTaskStatus[] = ['todo', 'running', 'gate-failed', 'done']
+export const STATUSES: readonly LedgerTaskStatus[] = ['todo', 'running', 'gate-failed', 'done', 'cancelled']
+
+// Whether nothing is left to do on a task: it is done, or will not be.
+export const isOver = (task: LedgerTask): boolean => task.status === 'done' || task.status === 'cancelled'
+
+// How long a task may stand as running with nothing touching its run and no
+// subagent on it before it counts as stalled.
+export const STALE_MS = 60 * 60 * 1000
+
+// Whether a task marked running has stalled: no subagent runs for it, and
+// nothing of its run has changed for `STALE_MS`. An agent that forgot to
+// settle it, or a session that ended, leaves it so.
+export const isStalled = (run: LedgerRun, task: LedgerTask, now: number): boolean =>
+  task.status === 'running' &&
+  !run.spawns.some(one => one.task === task.id && one.endedAt === undefined) &&
+  now - (run.changedAt ?? run.startedAt) > STALE_MS
 
 export const isRun = (value: unknown): value is LedgerRun =>
   typeof value === 'object' &&
@@ -82,6 +99,10 @@ export const plan = (
       ...(one.tier ? { tier: one.tier.trim() } : {}),
       ...(one.about?.trim() ? { about: one.about.trim() } : {}),
       ...(one.check ? { check: one.check.trim() } : {}),
+      // Only tasks of this plan count, and never the task itself.
+      ...((one.needs ?? []).some(need => ids.includes(need.trim()) && need.trim() !== one.id.trim())
+        ? { needs: (one.needs ?? []).map(need => need.trim()).filter(need => ids.includes(need) && need !== one.id.trim()) }
+        : {}),
       status: 'todo' as const,
     })),
     spawns: [],
@@ -193,18 +214,26 @@ export const orphaned = (run: LedgerRun, now: number): LedgerRun => ({
   ),
 })
 
-// Records a subagent's turn as over; a run that never saw it start is unchanged.
+// Records a subagent's turn as over, with what it said as it ended; a run
+// that never saw it start is unchanged.
 export const ended = (
   run: LedgerRun,
   agentId: string,
   reason: string,
   tokens: number | undefined,
   now: number,
+  report?: string,
 ): LedgerRun => ({
   ...run,
   spawns: run.spawns.map(one =>
     one.agentId === agentId
-      ? { ...one, endedAt: now, reason, ...(tokens !== undefined ? { tokens: (one.tokens ?? 0) + tokens } : {}) }
+      ? {
+          ...one,
+          endedAt: now,
+          reason,
+          ...(tokens !== undefined ? { tokens: (one.tokens ?? 0) + tokens } : {}),
+          ...(report !== undefined && report !== '' ? { report } : {}),
+        }
       : one,
   ),
 })
@@ -301,6 +330,8 @@ export type LedgerCounts = {
   unitName: string
   tasks: number
   done: number
+  // The tasks that will not be done.
+  cancelled: number
   failed: number
   running: number
   agents: number
@@ -311,7 +342,7 @@ export type LedgerCounts = {
 
 export const countsOf = (run: LedgerRun): LedgerCounts => {
   const units = unitsOf(run)
-  const at = units.findIndex(unit => unit.tasks.some(one => one.status !== 'done'))
+  const at = units.findIndex(unit => unit.tasks.some(one => !isOver(one)))
   const here = at === -1 ? units.length - 1 : at
   const open = run.findings.filter(one => one.status === 'open')
 
@@ -321,6 +352,7 @@ export const countsOf = (run: LedgerRun): LedgerCounts => {
     unitName: units[here]?.name ?? '',
     tasks: run.tasks.length,
     done: run.tasks.filter(one => one.status === 'done').length,
+    cancelled: run.tasks.filter(one => one.status === 'cancelled').length,
     failed: run.tasks.filter(one => one.status === 'gate-failed').length,
     running: run.tasks.filter(one => one.status === 'running').length,
     agents: run.spawns.filter(one => one.endedAt === undefined).length,
@@ -330,7 +362,8 @@ export const countsOf = (run: LedgerRun): LedgerCounts => {
   }
 }
 
-export const isDone = (run: LedgerRun): boolean => run.tasks.every(one => one.status === 'done')
+// Whether no task is left: each is done, or cancelled.
+export const isDone = (run: LedgerRun): boolean => run.tasks.every(isOver)
 
 const few = (count: number, one: string, many = `${one}s`) => `${count} ${count === 1 ? one : many}`
 
@@ -341,45 +374,72 @@ export const tokensText = (tokens: number): string =>
       ? `${Math.round(tokens / 1000)}k`
       : String(tokens)
 
-// The status line's entry. Undefined once the run has nothing left to say:
-// every task done, no agent running and no finding open.
-export const statusText = (run: LedgerRun): string | undefined => {
+// The task work is on: one a subagent is running for, else one marked running,
+// else a failed gate waiting to be dealt with, else the next still to do.
+export const focusOf = (run: LedgerRun): LedgerTask | undefined => {
+  const live = new Set(
+    run.spawns.flatMap(one => (one.endedAt === undefined && one.task !== undefined ? [one.task] : [])),
+  )
+
+  return (
+    run.tasks.find(one => !isOver(one) && live.has(one.id)) ??
+    run.tasks.find(one => one.status === 'running') ??
+    run.tasks.find(one => one.status === 'gate-failed') ??
+    run.tasks.find(one => one.status === 'todo')
+  )
+}
+
+// The most of a task's title the status line shows.
+export const STATUS_MOST = 36
+
+// The status line's entry: the task work is on, and how many more are not
+// done (`others` counts those of other runs under way). Undefined once the run
+// has nothing left to say: every task done, no agent running and no finding
+// open.
+export const statusText = (run: LedgerRun, others = 0): string | undefined => {
   const counts = countsOf(run)
 
   if (isDone(run) && counts.agents === 0 && counts.openFindings === 0) {
     return undefined
   }
 
-  // A run in lanes says how each lane stands, a failed gate marked on its lane.
-  if (hasLanes(run) && !isDone(run)) {
+  const now = focusOf(run)
+
+  // Every task is done: what keeps the run open is all there is to say.
+  if (now === undefined) {
     return [
-      `${ICON.tasks} ${lanesOf(run)
-        .map(
-          lane =>
-            `${lane.name === '' ? 'other' : lane.name} ${lane.failed > 0 ? `${ICON.failed} ` : ''}${lane.done}/${lane.tasks}`,
-        )
-        .join(' · ')}`,
-      counts.agents > 0 ? `${ICON.agents} ${counts.agents}` : '',
-      counts.openFindings > 0 ? `${ICON.finding} ${counts.openFindings}` : '',
+      `${ICON.tasks} all ${few(counts.done, 'task')} done${counts.cancelled > 0 ? `, ${counts.cancelled} cancelled` : ''}`,
+      counts.openFindings > 0 ? `${few(counts.openFindings, 'finding')} open` : '',
+      counts.agents > 0 ? `${few(counts.agents, 'agent')} running` : '',
+      others > 0 ? `${others} more` : '',
     ]
       .filter(Boolean)
       .join(' · ')
   }
 
-  return [
-    `${ICON.tasks} ${
-      isDone(run)
-        ? `all ${few(counts.tasks, 'task')} done`
-        : `unit ${counts.unitAt}/${counts.units} ${counts.unitName} · ${counts.done}/${counts.tasks} tasks`
-    }`,
-    counts.failed > 0 ? `${ICON.failed} ${few(counts.failed, 'gate')} failed` : '',
-    counts.agents > 0 ? `${ICON.agents} ${few(counts.agents, 'agent')} running` : '',
-    counts.openFindings > 0
-      ? `${ICON.finding} ${few(counts.openFindings, 'finding')}${counts.errors > 0 ? ` (${few(counts.errors, 'error')})` : ''}`
-      : '',
-  ]
-    .filter(Boolean)
-    .join(' · ')
+  const more = counts.tasks - counts.done - counts.cancelled - 1 + others
+
+  return `${ICON.tasks} ${now.status === 'gate-failed' ? `${ICON.failed} ` : ''}${now.id} ${cut(now.title, STATUS_MOST)}${more > 0 ? ` · ${more} more` : ''}`
+}
+
+// The end of a text no longer than `most`, an ellipsis standing for what was
+// cut from its start: a path keeps its file's name.
+export const tail = (text: string, most: number): string =>
+  text.length > most ? `…${text.slice(text.length - Math.max(0, most - 1))}` : text
+
+// What a write is answered with when it leaves something to settle: the
+// findings left open once every task is done, else the open findings of the
+// tasks just marked done. '' with nothing to say.
+export const leftOpen = (run: LedgerRun, doneIds: readonly string[]): string => {
+  const open = run.findings.filter(one => one.status === 'open')
+  const mine = open.filter(one => one.task !== undefined && doneIds.includes(one.task))
+  const named = (list: readonly LedgerFinding[]) => list.map(one => `#${one.id}`).join(', ')
+
+  return isDone(run) && open.length > 0
+    ? `Every task is done, but ${few(open.length, 'finding')} still open (${named(open)}): fix and close with the fixed tool, or tell the user why it stays open.`
+    : mine.length > 0
+      ? `${few(mine.length, 'finding')} still open on the tasks marked done (${named(mine)}): close with the fixed tool once dealt with.`
+      : ''
 }
 
 const MARKS: Record<LedgerTaskStatus, string> = {
@@ -387,6 +447,7 @@ const MARKS: Record<LedgerTaskStatus, string> = {
   running: ICON.running,
   'gate-failed': ICON.failed,
   done: ICON.done,
+  cancelled: '⊘',
 }
 
 export const placeOf = (finding: LedgerFinding): string =>
@@ -396,7 +457,7 @@ export const placeOf = (finding: LedgerFinding): string =>
 export const findingText = (finding: LedgerFinding): string =>
   `Finding #${finding.id} (${finding.severity}) ${placeOf(finding)}: ${finding.summary}`
 
-const spanText = (ms: number): string => {
+export const spanText = (ms: number): string => {
   const seconds = Math.max(0, Math.round(ms / 1000))
 
   return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`

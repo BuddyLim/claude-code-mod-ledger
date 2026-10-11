@@ -55,7 +55,7 @@ test('a planned run is numbered, kept and made current; the one before it stays'
   expect(clash(two, ['T1', 'T7'])).toContain('Task id T1 is in use')
   expect(clash(two, ['T7'])).toBeUndefined()
   expect(nextFinding(two)).toBe(1)
-  expect(bookStatus(two)).toContain('second 0/1 · first 0/1')
+  expect(bookStatus(two)).toContain('T1 do it · 1 more')
   expect(bookStatus(EMPTY)).toBeUndefined()
   // The newest first in the list.
   expect(listed(two, false).map(run => run.id)).toEqual([2, 1])

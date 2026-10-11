@@ -1,8 +1,10 @@
 {
   "name": "ledger",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "The record of orchestrated work: runs of units and tasks, the subagents spawned for them, each gate's verdict and the findings reviewers report, summed up in the status line while there is something to say. It can follow a superpowers plan document as its input. Run /ledger.",
-  "author": { "name": "Kuang Tar Lim" },
+  "author": {
+    "name": "Kuang Tar Lim"
+  },
   "license": "MIT",
   "repository": "https://github.com/BuddyLim/claude-code-mod-ledger",
   "types": "./types/index.d.ts",

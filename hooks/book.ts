@@ -1,18 +1,19 @@
-// The project's runs, kept together: every run planned here, the newest last,
-// and which one is current. Free of the engine, as run.ts is.
+// A session's runs, kept together: every run planned in it, the newest last,
+// and which one is current. A session resumed finds its book as it left it.
+// Free of the engine, as run.ts is.
 
-import type { LedgerRun } from '../types'
+import type { LedgerRun, LedgerSessionNote } from '../types'
 import { ICON } from './kit/icons'
-import { cut } from './kit/layout'
-import { countsOf, isDone, isRun, statusText, tokensText } from './run'
+import { countsOf, isDone, isOver, isRun, isStalled, statusText, tokensText } from './run'
 
 // `current` is the id of the run the tools record against (0 for none): the
-// one planned last, or the one the user picked.
-export type Book = { nextId: number; current: number; runs: LedgerRun[] }
+// one planned last, or the one the user picked. `cwd` is the folder the
+// session ran in, for the list of sessions.
+export type Book = { nextId: number; current: number; runs: LedgerRun[]; cwd?: string }
 
 export const EMPTY: Book = { nextId: 1, current: 0, runs: [] }
 
-// How many runs a project keeps. Past it the oldest done ones are dropped; a
+// How many runs a session keeps. Past it the oldest done ones are dropped; a
 // run not done is never dropped.
 export const KEPT = 40
 
@@ -73,11 +74,12 @@ const pruned = (book: Book): Book => {
 export const put = (book: Book, run: LedgerRun, now: number): Book =>
   run.id === 0
     ? pruned({
+        ...book,
         nextId: book.nextId + 1,
         current: book.nextId,
-        runs: [...book.runs, settled({ ...run, id: book.nextId }, now)],
+        runs: [...book.runs, settled({ ...run, id: book.nextId, changedAt: now }, now)],
       })
-    : { ...book, runs: book.runs.map(one => (one.id === run.id ? settled(run, now) : one)) }
+    : { ...book, runs: book.runs.map(one => (one.id === run.id ? settled({ ...run, changedAt: now }, now) : one)) }
 
 // Forgets a run for good. Clearing the current one leaves none current.
 export const cleared = (book: Book, id: number): Book => ({
@@ -131,6 +133,14 @@ export const busyOf = (book: Book): number =>
     .filter(one => one.doneAt === undefined)
     .reduce((sum, one) => sum + one.spawns.filter(spawn => spawn.endedAt === undefined).length, 0)
 
+// Whether work is under way in a run not done: a subagent running, or a task
+// marked running that has not stalled. It is what the turning mark stands for.
+export const isTurning = (book: Book, now: number): boolean =>
+  busyOf(book) > 0 ||
+  book.runs.some(
+    one => one.doneAt === undefined && one.tasks.some(task => task.status === 'running' && !isStalled(one, task, now)),
+  )
+
 // The runs still under way, the newest first: where a write looks for its run.
 export const underWay = (book: Book): LedgerRun[] =>
   book.runs.filter(one => one.doneAt === undefined).reverse()
@@ -165,25 +175,131 @@ export const clash = (book: Book, ids: readonly string[]): string | undefined =>
 export const nextFinding = (book: Book): number =>
   Math.max(1, ...book.runs.map(one => one.nextFinding))
 
-// The status line's entry for the whole book: the one run under way in full,
-// several as a count of tasks each, and nothing with none under way.
+// The status line's entry for the whole book: the task work is on in the
+// newest run under way, and how many more tasks are not done across them all.
+// Nothing with no run under way.
 export const bookStatus = (book: Book): string | undefined => {
-  const live = underWay(book)
-  const only = live[0]
+  const [newest, ...rest] = underWay(book)
 
-  if (only === undefined) {
-    return undefined
+  return newest === undefined
+    ? undefined
+    : statusText(
+        newest,
+        rest.reduce((sum, one) => sum + one.tasks.filter(task => !isOver(task)).length, 0),
+      )
+}
+
+// The sessions that have a ledger, each in a line, the latest changed first:
+// what the list of sessions reads, so no book is opened to draw it.
+export const isIndex = (value: unknown): value is LedgerSessionNote[] =>
+  Array.isArray(value) &&
+  value.every(
+    one =>
+      typeof one === 'object' &&
+      one !== null &&
+      typeof (one as LedgerSessionNote).id === 'string' &&
+      typeof (one as LedgerSessionNote).cwd === 'string' &&
+      typeof (one as LedgerSessionNote).at === 'number',
+  )
+
+// How many sessions' ledgers are kept. Past it the ones changed longest ago
+// are dropped.
+export const SESSIONS_KEPT = 60
+
+// A session's book in a line, as it stood at `at`.
+export const noteOf = (id: string, book: Book, at: number): LedgerSessionNote => ({
+  id,
+  cwd: book.cwd ?? '',
+  at,
+  goal: (currentOf(book) ?? book.runs.at(-1))?.goal ?? '',
+  open: underWay(book).length,
+  ...(isTurning(book, at) ? { busy: true as const } : {}),
+  size: JSON.stringify(book).length,
+  runs: book.runs.length,
+})
+
+// The index with a session's line put first, or taken out when its book has
+// no run left; and the sessions dropped for being past the limit.
+export const noted = (
+  index: readonly LedgerSessionNote[],
+  note: LedgerSessionNote,
+): { index: LedgerSessionNote[]; dropped: string[] } => {
+  const all = [...(note.runs > 0 ? [note] : []), ...index.filter(one => one.id !== note.id)].sort(
+    (a, b) => b.at - a.at,
+  )
+
+  return { index: all.slice(0, SESSIONS_KEPT), dropped: all.slice(SESSIONS_KEPT).map(one => one.id) }
+}
+
+// The sessions as their list shows them: those of this folder first, each
+// group the latest changed first.
+export const sessionsListed = (index: readonly LedgerSessionNote[], cwd: string): LedgerSessionNote[] => [
+  ...index.filter(one => one.cwd === cwd),
+  ...index.filter(one => one.cwd !== cwd),
+]
+
+// The session a run with no session recorded is filed under: one a folder.
+export const unnamedSession = (cwd: string): string => `before:${cwd}`
+
+// A book kept for a whole folder, as it was before each session kept its own,
+// as one book a session: each run goes to the session that planned it.
+export const splitOld = (old: Book, cwd: string): Map<string, Book> => {
+  const books = new Map<string, Book>()
+
+  for (const run of old.runs) {
+    const id = run.sessionId ?? unnamedSession(cwd)
+    const book = books.get(id) ?? { nextId: old.nextId, current: 0, runs: [], cwd }
+
+    books.set(id, { ...book, runs: [...book.runs, run] })
   }
 
-  if (live.length === 1) {
-    return statusText(only)
-  }
-
-  return `${ICON.tasks} ${live
-    .map(one => {
-      const counts = countsOf(one)
-
-      return `${cut(one.goal === '' ? `run ${one.id}` : one.goal, 16)} ${counts.failed > 0 ? `${ICON.failed} ` : ''}${counts.done}/${counts.tasks}`
+  // A session's current run is the folder's where that was its own, else the
+  // one it planned last.
+  for (const [id, book] of books) {
+    books.set(id, {
+      ...book,
+      current: book.runs.some(one => one.id === old.current) ? old.current : (book.runs.at(-1)?.id ?? 0),
     })
-    .join(' · ')}`
+  }
+
+  return books
+}
+
+// When a book last changed, as far as its runs say.
+export const changedAt = (book: Book): number =>
+  Math.max(0, ...book.runs.map(one => one.doneAt ?? one.startedAt))
+
+// How much of the store the ledgers may take in all, in characters of JSON:
+// under the 4 MiB the engine gives a plugin's store, with room to spare.
+export const STORE_BUDGET = 3_000_000
+
+// A session's book with only the runs not done, to make room: null when it
+// has none, so nothing of it is worth keeping.
+export const trimmed = (book: Book): Book | null => {
+  const open = book.runs.filter(one => one.doneAt === undefined)
+
+  return open.length === 0
+    ? null
+    : { ...book, current: open.some(one => one.id === book.current) ? book.current : 0, runs: open }
+}
+
+// The sessions to make room from when the ledgers are over `budget`, the one
+// changed longest ago first, and never `keep`, the session at work. Enough of
+// them that, were each emptied, the rest would fit.
+export const overBudget = (index: readonly LedgerSessionNote[], keep: string, budget = STORE_BUDGET): string[] => {
+  let total = index.reduce((sum, one) => sum + (one.size ?? 0), 0)
+  const ids: string[] = []
+
+  for (const one of [...index].sort((a, b) => a.at - b.at)) {
+    if (total <= budget) {
+      break
+    }
+
+    if (one.id !== keep) {
+      ids.push(one.id)
+      total -= one.size ?? 0
+    }
+  }
+
+  return ids
 }

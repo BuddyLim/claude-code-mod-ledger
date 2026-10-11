@@ -1,7 +1,9 @@
 // The ledger's contract. Another mod reads a run with
 // `$.state.get({ plugin: 'ledger', key: 'run' })`; only the ledger writes it.
 
-export type LedgerTaskStatus = 'todo' | 'running' | 'gate-failed' | 'done'
+// `cancelled` is a task that will not be done: it holds a run open no more
+// than a done one does.
+export type LedgerTaskStatus = 'todo' | 'running' | 'gate-failed' | 'done' | 'cancelled'
 
 export type LedgerTask = {
   id: string
@@ -26,6 +28,8 @@ export type LedgerTask = {
   outcome?: string
   // The checkbox steps of a task read from a plan document, in its order.
   steps?: LedgerStep[]
+  // The tasks it needs done before it starts, by id, where the plan says.
+  needs?: string[]
 }
 
 export type LedgerStep = { text: string; isDone: boolean }
@@ -46,6 +50,9 @@ export type LedgerSpawn = {
   endedAt?: number
   reason?: string
   tokens?: number
+  // What it said as its turn ended, cut short: its report, as close as the
+  // ledger has to a log of the work.
+  report?: string
 }
 
 export type LedgerSeverity = 'error' | 'warning' | 'note'
@@ -63,8 +70,25 @@ export type LedgerFinding = {
   status: 'open' | 'fixed'
 }
 
+// A session's ledger in a line, for the list of sessions: the session, the
+// folder it ran in, when its ledger last changed, the goal of its current
+// run, and how many of its runs are not done, of how many.
+export type LedgerSessionNote = {
+  id: string
+  cwd: string
+  at: number
+  goal: string
+  open: number
+  runs: number
+  // Whether work was under way when it last changed: a subagent running, or a
+  // task marked running. A session that ended so keeps the mark until resumed.
+  busy?: true
+  // How much of the store its ledger takes, in characters of JSON.
+  size?: number
+}
+
 export type LedgerRun = {
-  // Its number among the project's runs; 0 until the ledger has kept it.
+  // Its number among the session's runs; 0 until the ledger has kept it.
   id: number
   goal: string
   startedAt: number
@@ -74,6 +98,9 @@ export type LedgerRun = {
   // running and no finding open, or when the user closed it (`isClosed`).
   doneAt?: number
   isClosed?: true
+  // When the ledger last changed anything of the run: a task marked running
+  // that nothing has touched for long has stalled.
+  changedAt?: number
   // The plan document the run is read from, where it is: the document is then
   // the word on its tasks and steps. `isLaidOutByModel` says a small model
   // grouped its lines, the document not being laid out as superpowers plans are.
@@ -90,11 +117,19 @@ declare module 'claude-code' {
   interface PluginState {
     ledger: {
       run: LedgerRun | null
-      // Every run kept for the project, the newest last; `run` is the current
+      // Every run kept for the session, the newest last; `run` is the current
       // one, which the tools record against.
       runs: LedgerRun[]
       isHidden: boolean
-      // The pane: the run it shows in full (0 for the list), the list's row the
+      // The session `run` and `runs` are read from: '' until the ledger loads.
+      home: string
+      // Another session's ledger the pane is showing, read only; null while
+      // it shows this session's. And the sessions that have one, the latest
+      // changed first, as last listed.
+      peek: { id: string; cwd: string; runs: LedgerRun[] } | null
+      others: LedgerSessionNote[]
+      // The pane: the run it shows in full (0 for the list of runs, -1 for
+      // the list of sessions), the list's row the
       // focus is on, whether done runs are listed, whether a run shows its
       // details, the run a clear is waiting to be confirmed for, and the frame
       // of the mark that turns while a subagent runs.
@@ -108,6 +143,9 @@ declare module 'claude-code' {
       // to be shown, which the lens mod opens where it is loaded: a path from
       // the session's folder, a line (0 for the file), and a count of the asks.
       pointed: number
+      // The task a run's overview shows in full, by id: '' for the one work
+      // is on.
+      picked: string
       jump: { path: string; line: number; n: number } | null
     }
   }

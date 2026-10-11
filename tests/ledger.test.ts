@@ -1,12 +1,16 @@
 import { expect, mock, test } from 'claude-code/testing'
 
 import type { LedgerRun } from '../types'
+import { GAP_MOST, LINK_MOST, gapFor, railsWide, rowsOf, stagesOf, stripOf, stripText, wrapped } from '../hooks/pipe'
 import {
+  STATUS_MOST,
   countsOf,
   ended,
   fixed,
+  focusOf,
   found,
   isDone,
+  leftOpen,
   orphaned,
   plan,
   report,
@@ -14,6 +18,7 @@ import {
   setTask,
   spawned,
   statusText,
+  tail,
   taskOf,
   tokensText,
   unitsOf,
@@ -103,36 +108,167 @@ test('a spawn is recorded against the task its description names', () => {
   expect(orphaned(started, 30).spawns[0]).toEqual({ ...started.spawns[0], endedAt: 30, reason: 'session ended' })
 })
 
-test('the band follows the run: the unit work is on, failed gates, agents and findings', () => {
+test('the status line names the task work is on and counts the rest, however long the plan', () => {
   let run = planned()
-  expect(bandText(run)).toContain('unit 1/2 Schema · 0/3 tasks')
+  // Nothing started: the next task to do, and the two after it.
+  expect(bandText(run)).toMatch(/T1 add the column · 2 more$/)
 
   run = must(setTask(run, 'T1', 'done'))
   run = must(setTask(run, 'T2', 'gate-failed', 'the backfill test fails'))
+  // A failed gate is what work is on until something else runs.
+  expect(bandText(run)).toMatch(/T2 backfill · 1 more$/)
+
   run = found(run, { path: 'src/backfill.ts', line: 12, severity: 'error', summary: 'skips null rows', task: 'T2' }, 3)
   run = found(run, { path: 'README.md', severity: 'note', summary: 'mention the flag' }, 4)
-  run = spawned(run, { agentId: 'a2', task: 'T2', description: '[T2] fix', type: 'general-purpose', model: 'sonnet', startedAt: 5 })
+  run = spawned(run, { agentId: 'a3', task: 'T3', description: '[T3] retry', type: 'general-purpose', model: 'sonnet', startedAt: 5 })
+  // The task a subagent is running for comes before one that waits.
+  expect(focusOf(run)?.id).toBe('T3')
+  expect(bandText(run)).toMatch(/T3 add the retry · 1 more$/)
+  // Findings, agents and lanes add nothing to it: one task and one count.
+  expect(bandText(run).split(' · ').length).toBe(2)
 
-  const text = bandText(run)
-  expect(text).toContain('unit 1/2 Schema · 1/3 tasks')
-  expect(text).toContain('1 gate failed')
-  expect(text).toContain('1 agent running')
-  expect(text).toContain('2 findings (1 error)')
-
-  // The unit moves on once its tasks are done, and a fixed finding leaves the band.
   run = must(setTask(run, 'T2', 'done', 'backfill passes'))
   run = must(fixed(run, [1]))
-  expect(bandText(run)).toContain('unit 2/2 API · 2/3 tasks')
-  expect(bandText(run)).toContain('1 finding')
-  expect(bandText(run)).not.toContain('error')
+  expect(bandText(run)).toMatch(/T3 add the retry$/)
   expect(fixed(run, [9])).toBe('No finding #9.')
   expect(setTask(run, 'T9', 'done')).toBe('No task T9. The tasks are T1, T2, T3.')
+
+  // A long title is cut, and a plan of many tasks in lanes is still one entry.
+  const wide = must(
+    plan(
+      'x',
+      Array.from({ length: 24 }, (_, at) => ({
+        id: `L${at}`,
+        lane: `lane ${at % 6}`,
+        title: 'a title that goes on for a good deal longer than the status line has room for',
+      })),
+      0,
+    ),
+  )
+  expect(bandText(wide)).toContain('· 23 more')
+  expect(bandText(wide).length).toBeLessThan(STATUS_MOST + 24)
 
   run = must(setTask(run, 'T3', 'done'))
   expect(isDone(run)).toBe(true)
   // One finding is still open, so the entry stays; fixed, it has nothing to say.
-  expect(bandText(run)).toContain('all 3 tasks done')
-  expect(statusText(ended(must(fixed(run, [2])), 'a2', 'answer', 10, 9))).toBeUndefined()
+  expect(bandText(run)).toContain('all 3 tasks done · 1 finding open')
+  expect(statusText(ended(must(fixed(run, [2])), 'a3', 'answer', 10, 9))).toBeUndefined()
+})
+
+test('a write that leaves findings open says which, so they are closed as the work goes', () => {
+  let run = planned()
+  run = found(run, { path: 'src/a.ts', severity: 'error', summary: 'wrong', task: 'T1' }, 1)
+  run = found(run, { path: 'src/b.ts', severity: 'note', summary: 'loose' }, 2)
+  run = must(setTask(run, 'T1', 'done'))
+
+  // The finding of the task marked done is named; one of no task is not yet.
+  expect(leftOpen(run, ['T1'])).toContain('1 finding still open on the tasks marked done (#1)')
+  expect(leftOpen(must(fixed(run, [1])), ['T1'])).toBe('')
+
+  run = must(setTask(must(setTask(run, 'T2', 'done')), 'T3', 'done'))
+  // Every task done: all that is open is named, whichever task it is on.
+  expect(leftOpen(run, ['T3'])).toContain('Every task is done, but 2 findings still open (#1, #2)')
+  expect(leftOpen(must(fixed(run, [1, 2])), ['T3'])).toBe('')
+})
+
+test('a run is laid out as a pipeline: stages in order, lanes forking and joining', () => {
+  const run = must(
+    plan(
+      'Checkout',
+      [
+        { id: 'S1', title: 'schema' },
+        { id: 'A1', lane: 'API', title: 'route' },
+        { id: 'A2', lane: 'API', title: 'tests' },
+        { id: 'W1', lane: 'Web', title: 'page' },
+        { id: 'M1', lane: 'Mobile', title: 'screen' },
+        { id: 'E1', title: 'end to end' },
+      ],
+      0,
+    ),
+  )
+
+  expect(stagesOf(run).map(one => (one.kind === 'one' ? one.task.id : one.lanes.map(lane => lane.tasks.length)))).toEqual([
+    'S1',
+    [2, 1, 1],
+    'E1',
+  ])
+
+  // Down the pane: a node a task, the lanes as rails that fork and join.
+  expect(
+    rowsOf(run).map(row =>
+      row.kind === 'task'
+        ? `${row.lead}o${row.trail} ${row.task.id}`
+        : row.kind === 'lane'
+          ? `${row.lead}v${row.trail} ${row.name}`
+          : row.rail,
+    ),
+  ).toEqual([
+    'o S1',
+    '├─┬─╮',
+    'v │ │ API',
+    'o │ │ A1',
+    'o │ │ A2',
+    '│ v │ Web',
+    '│ o │ W1',
+    '│ │ v Mobile',
+    '│ │ o M1',
+    '├─┴─╯',
+    'o E1',
+  ])
+  // A wide pane draws the rails further apart; a narrow one keeps them close
+  // so the words beside them have at least two thirds of it.
+  expect(gapFor(run, 120)).toBe(GAP_MOST)
+  expect(gapFor(run, 30)).toBe(3)
+  expect(gapFor(run, 12)).toBe(1)
+  expect(railsWide(run, 3)).toBe(9)
+  expect(rowsOf(run, 3).flatMap(row => (row.kind === 'link' ? [row.rail] : []))).toEqual(['├───┬───╮', '├───┴───╯'])
+  expect(rowsOf(run, 3).flatMap(row => (row.kind === 'task' ? [`${row.lead}o${row.trail}|${row.task.id}`] : []))).toEqual([
+    // A task in the line stands beside its own node, not out past the fork.
+    'o|S1',
+    'o   │   │|A1',
+    'o   │   │|A2',
+    '│   o   │|W1',
+    '│   │   o|M1',
+    'o|E1',
+  ])
+  // A long text is broken at its spaces to fit beside the rails.
+  expect(wrapped('ExpensesPage: typed NL handling + Add modal toggle', 20)).toEqual([
+    'ExpensesPage: typed',
+    'NL handling + Add',
+    'modal toggle',
+  ])
+  expect(wrapped('averyveryverylongword short', 10)).toEqual(['averyveryv', 'erylongwor', 'd short'])
+  expect(wrapped('', 10)).toEqual([''])
+
+  // With something drawn after the last task the line runs on past it, and a
+  // fork that ends the run joins the line again.
+  expect(stripOf(run, 13, true)?.map(line => stripText(line).trimEnd())).toEqual(['○─┬─○─○─┬─○─', '  ├─○───┤', '  ╰─○───╯'])
+  const forked = must(plan('x', [{ id: 'A', lane: 'a', title: 'a' }, { id: 'B', lane: 'b', title: 'b' }], 0))
+  expect(stripOf(forked, 5)?.map(line => stripText(line).trimEnd())).toEqual(['┬─○─╮', '╰─○─╯'])
+  expect(stripOf(forked, 6, true)?.map(line => stripText(line).trimEnd())).toEqual(['┬─○─┬─', '╰─○─╯'])
+  // Drawn down between what is before and after it, a fork at either end of
+  // the run opens from the line and closes back onto it.
+  expect(rowsOf(forked, 1, true).flatMap(row => (row.kind === 'link' ? [row.rail] : []))).toEqual(['├─╮', '├─╯'])
+  expect(rowsOf(forked, 1).flatMap(row => (row.kind === 'link' ? [row.rail] : []))).toEqual(['┌─╮', '└─╯'])
+  // Across the top, as a CI run is drawn: the line splits, and joins again.
+  const strip = stripOf(must(setTask(run, "S1", "done")), 11)?.map(line => stripText(line).trimEnd())
+  expect(strip).toEqual(['●─┬─○─○─┬─○', '  ├─○───┤', '  ╰─○───╯'])
+  // Too narrow for it, the strip is left out and the rows stand alone.
+  expect(stripOf(run, 10)).toBeUndefined()
+  // Given more room, the lines between nodes grow to take it, up to a limit.
+  expect(stripOf(run, 26)?.map(line => stripText(line).trimEnd())).toEqual([
+    "○────┬────○────○────┬────○",
+    "     ├────○─────────┤",
+    "     ╰────○─────────╯",
+  ])
+  expect(stripText(stripOf(run, 500)?.[0] ?? []).length).toBe(6 + 5 * LINK_MOST)
+  // A run with units names each where it starts; one with none has no such row.
+  expect(rowsOf(planned()).filter(row => row.kind === 'unit').map(row => row.kind === 'unit' && row.name)).toEqual([
+    'Schema',
+    'API',
+  ])
+  expect(rowsOf(run).some(row => row.kind === 'unit')).toBe(false)
+  expect(tail('src/deep/down/the/tree/file.ts:12', 14)).toBe('…ee/file.ts:12')
 })
 
 test('the report lists every task under its unit, then the open findings', () => {
@@ -250,7 +386,7 @@ test('the status line has an entry while a run has something to say, and none wh
   expect(entries.at(-1)).toBeUndefined()
 
   await $.tool.call({ tool: 'mcp__ledger__plan', goal: 'Queue retries', tasks: TASKS })
-  expect(entries.at(-1)).toContain('unit 1/2 Schema · 0/3 tasks')
+  expect(entries.at(-1)).toContain('T1 add the column · 2 more')
 
   // A command as the person types it at the prompt.
   const typed = { origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 100 } } as const
@@ -260,7 +396,7 @@ test('the status line has an entry while a run has something to say, and none wh
   )
   expect(entries.at(-1)).toBeUndefined()
   await $.command.run({ command: 'ledger', args: 'show', ...typed })
-  expect(entries.at(-1)).toContain('unit 1/2 Schema')
+  expect(entries.at(-1)).toContain('T1 add the column')
 
   // Every task done with nothing open: the entry empties by itself.
   for (const id of ['T1', 'T2', 'T3']) {
@@ -448,7 +584,8 @@ test('each write finds its own run; a run closes by itself, and clearing asks fi
   const both = String((await $.tool.call({ tool: 'mcp__ledger__report' })).result)
   expect(both).toContain('Ledger: Second feature')
   expect(both).toContain('Ledger: First feature')
-  expect(entries.at(-1)).toContain('Second feature 0/1 · First feature 0/1')
+  // The newest run's next task, and the one task of the other run still to do.
+  expect(entries.at(-1)).toContain('B1 b · 1 more')
 
   // A spawn, a finding and a task update for the older run land in it, with no
   // run picked by hand.
@@ -563,8 +700,8 @@ test('a plan in lanes shows each lane’s progress, in the status line, the repo
     fork: false,
   })
 
-  // The status line: a count per lane, a failed gate marked on its lane.
-  expect(entries.at(-1)).toMatch(/API 1\/2 · Web 0\/1 · Mobile . 0\/1/)
+  // The status line: the task a subagent is on, and how many more are not done.
+  expect(entries.at(-1)).toMatch(/W1 draw the cart · 2 more$/)
 
   const read = String((await $.tool.call({ tool: 'mcp__ledger__report' })).result)
   expect(read).toContain('Lane API (1/2 done)')
@@ -588,6 +725,66 @@ test('a plan in lanes shows each lane’s progress, in the status line, the repo
   const has = async (text: RegExp) => (await ui.find({ type: 'Text', text })) !== undefined
 
   await ui.press({ key: 'run-1' })
+  // The overview: the pipeline across, and words only for what is running or
+  // has failed. No lane or unit is named, and no task that waits or is done.
+  // The pipeline is a region of its own, which takes the pointer.
+  const texts = (await ui.findAll({ type: 'Text', in: 'strip' })).map(one => one.text)
+  // Each node's id is written on the line after it.
+  // The fork that ends the run joins the line again, which runs on to its
+  // end: nothing comes after this run.
+  // Nothing was planned before it either: the line has a start.
+  expect(texts.some(text => /^◆ start ─┬─+● A1 ─+○ A2 ─+┬─+◆ end$/.test(text))).toBe(true)
+  expect(texts.some(text => /^ +╰─+✗ M1 ─+╯/.test(text))).toBe(true)
+  // The task work is on is shown in full: where it sits and what it cost.
+  expect(await has(/^Current task$/)).toBe(true)
+  expect(await has(/W1 draw the cart/)).toBe(true)
+  expect(await has(/running · lane Web · Cart page/)).toBe(true)
+  expect(await has(/claude-sonnet · 1 agent/)).toBe(true)
+  // The failed gate keeps a line; a task that waits or is done has none.
+  expect(await has(/tests fail/)).toBe(true)
+  expect(await has(/^API/)).toBe(false)
+  expect(await has(/add the route/)).toBe(false)
+
+  // The keys walk the nodes: the next task is shown in its place, and the
+  // one work is on comes back when asked.
+  await ui.press({ key: 'next' })
+  expect(await has(/^Task$/)).toBe(true)
+  expect(await has(/M1 draw the screen/)).toBe(true)
+  expect(await has(/gate failed: tests fail/)).toBe(true)
+  await ui.press({ key: 'prev' })
+  await ui.press({ key: 'prev' })
+  expect(await has(/A2 add the route/)).toBe(true)
+  expect(await has(/to do · lane API · Endpoints/)).toBe(true)
+  await ui.press({ key: 'current' })
+  expect(await has(/^Current task$/)).toBe(true)
+  expect(await has(/add the route/)).toBe(false)
+
+  // A click on a node picks its task, as the keys do: on the node itself,
+  // or on the id beside it.
+  // The region's lines, each found by how it begins (its pieces are texts too).
+  const drawn = (await ui.findAll({ type: 'Text', in: 'strip' })).map(one => one.text)
+  const top = drawn.find(text => /^◆ start ─┬─/.test(text)) ?? ''
+  const last = drawn.find(text => /^ +╰─/.test(text)) ?? ''
+  const click = async (x: number, y: number) => {
+    await ui.pointer({ type: 'down', x, y, button: 'left', in: 'strip' })
+    await ui.pointer({ type: 'up', x, y, button: 'left', in: 'strip' })
+  }
+
+  // On the id beside the node, in the first lane.
+  await click(top.indexOf('A2'), 0)
+  expect(await has(/to do · lane API · Endpoints/)).toBe(true)
+  // On the node itself, two lanes down: the cell before " M1 ".
+  await click(last.indexOf(' M1 ') - 1, 2)
+  expect(await has(/gate failed: tests fail/)).toBe(true)
+  expect(await has(/to do · lane API · Endpoints/)).toBe(false)
+  // A click on a line between nodes picks nothing: the same task is shown.
+  await click(top.indexOf('┬') + 1, 0)
+  expect(await has(/gate failed: tests fail/)).toBe(true)
+  await ui.press({ key: 'current' })
+
+  // Details: the pipeline down, every lane, unit and task on a line.
+  await ui.press({ key: 'details' })
+  expect(await has(/add the route/)).toBe(true)
   expect(await has(/^API/)).toBe(true)
   expect(await has(/^Web/)).toBe(true)
   expect(await has(/^Mobile/)).toBe(true)
